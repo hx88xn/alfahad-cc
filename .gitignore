@@ -1,0 +1,4 @@
+.env
+recordings/
+pages/
+__pycache__/

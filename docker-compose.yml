@@ -1,0 +1,10 @@
+services:
+  alfardan-callcenter:
+    build: .
+    ports:
+      - "7035:7035"
+    env_file:
+      - .env
+    volumes:
+      - ./recordings:/app/recordings
+    restart: unless-stopped
