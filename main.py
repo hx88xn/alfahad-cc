@@ -789,7 +789,8 @@ async def media_stream_browser(websocket: WebSocket):
                             # Generate custom item_id for RAG searches so we can delete them later
                             rag_item_id = None
                             if func_name == "search_knowledge_base":
-                                rag_item_id = f"rag_output_{call_id_internal}_{int(time.time() * 1000)}"
+                                # OpenAI caps item.id at 32 chars; keep the rag_output_ prefix (used for deletion) + a short unique suffix
+                                rag_item_id = f"rag_output_{uuid.uuid4().hex[:16]}"
                             
                             # Send result back to OpenAI
                             function_output = {
