@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from pydub import AudioSegment
 import audioop
 from contextlib import suppress
-from prompts import function_call_tools, build_system_message, build_chat_system_message, chat_tools
+from prompts import function_call_tools, build_system_message, build_chat_system_message, chat_tools, get_language_accent_result
 from utils import *
 import httpx
 from call_log_apis import *
@@ -238,6 +238,14 @@ async def execute_function_call(func_name: str, func_args: dict) -> dict:
         dict: Function execution result
     """
     try:
+        # Per-turn language + accent re-anchor (silent). Echoes a per-language
+        # accent instruction back to the model so it never carries the default
+        # Najdi accent into Urdu/Hindi/Tamil/Tagalog/English.
+        if func_name == "set_response_language":
+            result = get_language_accent_result(func_args.get("language", ""))
+            print(f"🌐 set_response_language → {result['language']} ({result['language_name']})")
+            return result
+
         # RAG Knowledge Base Search
         if func_name == "search_knowledge_base":
             return await search_knowledge_base(query=func_args.get("query", ""))

@@ -19,6 +19,70 @@ VOICE_NAMES = {
     'sage': 'Sara'
 }
 
+# Supported response languages and their human names.
+LANG_NAMES = {
+    'ar': 'Najdi (Riyadh) Arabic',
+    'ur': 'Pakistani Urdu',
+    'hi': 'Hindi',
+    'ta': 'Tamil',
+    'tl': 'Tagalog/Filipino',
+    'en': 'English',
+}
+
+# Per-language ACCENT lock. This text is echoed back to the realtime model in the
+# `set_response_language` tool result so it re-anchors its accent EVERY turn and
+# never carries the default Najdi/Arabic accent into another language.
+LANG_ACCENT_INSTRUCTIONS = {
+    'ar': (
+        "Speak the entire reply in natural Najdi (Riyadh, Saudi) Arabic with an "
+        "authentic Saudi accent and intonation. This is the only language where the "
+        "Najdi/Arabic accent applies."
+    ),
+    'ur': (
+        "Speak the entire reply in natural PAKISTANI Urdu with an authentic native "
+        "Pakistani accent, pronunciation, rhythm and intonation — like a Lahore/"
+        "Karachi/Islamabad customer-service agent. ABSOLUTELY DO NOT carry over any "
+        "Arabic/Najdi accent, Arabic intonation, or Arabic-style pronunciation of Urdu "
+        "words. Do NOT use an Indian/Hindi accent or Sanskritized vocabulary. Pronounce "
+        "Urdu sounds as a native Pakistani would (retroflex ٹ/ڈ/ڑ, soft h, Pakistani ق/خ/غ)."
+    ),
+    'hi': (
+        "Speak the entire reply in natural Hindi with an authentic native Hindi accent "
+        "and pronunciation. DO NOT carry over any Arabic/Najdi accent or intonation."
+    ),
+    'ta': (
+        "Speak the entire reply in natural Tamil with an authentic native Tamil accent "
+        "and pronunciation. DO NOT carry over any Arabic/Najdi accent or intonation."
+    ),
+    'tl': (
+        "Speak the entire reply in natural Tagalog/Filipino with an authentic native "
+        "Filipino accent and pronunciation. DO NOT carry over any Arabic/Najdi accent."
+    ),
+    'en': (
+        "Speak the entire reply in natural English with a clear, neutral accent. "
+        "DO NOT carry over any Arabic/Najdi accent or intonation."
+    ),
+}
+
+
+def get_language_accent_result(language: str) -> dict:
+    """Build the tool result for `set_response_language`.
+
+    Echoes an explicit per-language ACCENT instruction back to the realtime model
+    so it re-anchors its accent every turn and never bleeds the Najdi accent into
+    Urdu/Hindi/Tamil/Tagalog/English.
+    """
+    lang = (language or "").strip().lower()
+    if lang not in LANG_ACCENT_INSTRUCTIONS:
+        # Unknown code → fall back to Najdi Arabic (the default voice).
+        lang = "ar"
+    return {
+        "success": True,
+        "language": lang,
+        "language_name": LANG_NAMES.get(lang, LANG_NAMES["ar"]),
+        "accent_instruction": LANG_ACCENT_INSTRUCTIONS[lang],
+    }
+
 
 def get_gendered_system_prompt(voice: str = 'echo') -> str:
     gender = VOICE_GENDER_MAP.get(voice, 'male')
@@ -34,6 +98,23 @@ def get_gendered_system_prompt(voice: str = 'echo') -> str:
         agent_grammar = "female"
 
     system_prompt = f"""
+🔴🔴🔴 LANGUAGE + ACCENT LOCK — MANDATORY PER-TURN PROTOCOL 🔴🔴🔴
+Supported languages: Najdi Arabic (ar, default), Pakistani Urdu (ur), Hindi (hi), Tamil (ta), Tagalog/Filipino (tl), English (en).
+
+⚙️ EVERY SINGLE REPLY MUST FOLLOW THIS ROUTINE — NO EXCEPTIONS:
+  1. Read ONLY the caller's MOST RECENT turn (earlier turns are context, not a language signal).
+  2. Decide which ONE supported language it is.
+  3. IMMEDIATELY call `set_response_language(language=<iso>, evidence="<words from their turn>")`. Do NOT speak before this call.
+  4. Read the 'accent_instruction' field in the tool result and SPEAK THE WHOLE REPLY in that language WITH THAT ACCENT.
+
+🔊 ACCENT IS PART OF THE LANGUAGE — THIS IS THE #1 RULE:
+- Your accent MUST match the language you are currently speaking. The Najdi/Arabic accent applies ONLY to Arabic (ar).
+- The instant you speak Urdu, switch to an authentic native PAKISTANI accent and pronunciation. NEVER carry the Arabic/Najdi accent, Arabic intonation, or Arabic-style pronunciation into Urdu. NEVER use an Indian/Hindi accent for Urdu.
+- Same for Hindi, Tamil, Tagalog/Filipino, English — use that language's own native accent, never an Arabic-accented version.
+- Think of it as fully changing voice persona per language: Arabic = Riyadh Najdi; Urdu = native Pakistani; etc. The `set_response_language` result tells you exactly which accent to use — obey it every turn.
+
+🚫 Skipping `set_response_language` is a protocol violation. Call it on EVERY reply, including the first reply after the greeting, short acknowledgements, clarifications, and the closing line. Re-evaluate language every turn — never reuse the previous turn's language out of habit; if the caller switches language, you switch in that same turn.
+
 ROLE: Al Fardan Exchange Contact Center Voice Agent — a Saudi Arabic AI call center agent speaking with customers by voice.
 Company: Al Fardan Exchange — money transfer, currency exchange, and related services per https://alfardanexchange.com/
 
@@ -117,6 +198,39 @@ WEBSITE FOCUS: Content reflects https://alfardanexchange.com/ and related custom
 
 
 function_call_tools = [
+    {
+        "type": "function",
+        "name": "set_response_language",
+        "description": (
+            "MANDATORY: Call this SILENT tool at the START of EVERY reply, BEFORE you "
+            "speak any words, to declare the language of the upcoming reply. The language "
+            "MUST match the caller's MOST RECENT spoken turn — not the previous turn, not "
+            "the call's opening language, not a guess from tone or emotion. The tool result "
+            "returns an 'accent_instruction' you MUST obey: it re-anchors your accent so you "
+            "never carry the default Najdi/Arabic accent into Urdu, Hindi, Tamil, Tagalog or "
+            "English. This tool produces NO spoken output and needs NO filler phrase. "
+            "Immediately after calling it, speak the whole reply in the declared language "
+            "with the returned accent."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "language": {
+                    "type": "string",
+                    "enum": ["ar", "ur", "hi", "ta", "tl", "en"],
+                    "description": (
+                        "ISO code for the upcoming reply. ar=Najdi Arabic (default), "
+                        "ur=Pakistani Urdu, hi=Hindi, ta=Tamil, tl=Tagalog/Filipino, en=English."
+                    ),
+                },
+                "evidence": {
+                    "type": "string",
+                    "description": "1-6 words quoted from the caller's most recent turn that justify this language choice.",
+                },
+            },
+            "required": ["language"],
+        },
+    },
     {
         "type": "function",
         "name": "search_knowledge_base",
