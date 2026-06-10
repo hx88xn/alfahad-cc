@@ -20,6 +20,7 @@ from pydub import AudioSegment
 import audioop
 from contextlib import suppress
 from prompts import function_call_tools, build_system_message, build_chat_system_message, chat_tools, get_language_accent_result
+from language_detector import detect_language
 from utils import *
 import httpx
 from call_log_apis import *
@@ -226,7 +227,7 @@ def generate_silence(duration_sec, sample_rate=8000):
 
 
 # Helper: Execute function calls from OpenAI
-async def execute_function_call(func_name: str, func_args: dict) -> dict:
+async def execute_function_call(func_name: str, func_args: dict, call_id: str | None = None) -> dict:
     """
     Execute the appropriate function based on the function name
     
@@ -240,10 +241,41 @@ async def execute_function_call(func_name: str, func_args: dict) -> dict:
     try:
         # Per-turn language + accent re-anchor (silent). Echoes a per-language
         # accent instruction back to the model so it never carries the default
-        # Najdi accent into Urdu/Hindi/Tamil/Tagalog/English.
+        # Najdi accent into Urdu/Hindi/Tamil/Tagalog/English. A deterministic
+        # classifier on the caller's transcribed turn silently OVERRIDES the
+        # model's pick when it disagrees with high confidence (the bankislami
+        # pattern) — this is what reliably stops Najdi-accent bleed.
         if func_name == "set_response_language":
-            result = get_language_accent_result(func_args.get("language", ""))
-            print(f"🌐 set_response_language → {result['language']} ({result['language_name']})")
+            declared = str(func_args.get("language", "")).strip().lower()
+            final_lang = declared
+            corrected = False
+            backend_lang = None
+            conf = 0.0
+
+            meta = call_metadata.get(call_id, {}) if call_id else {}
+            turn_text = meta.get("_current_user_turn_text", "") if meta else ""
+            if turn_text:
+                backend_lang, conf, _dbg = detect_language(turn_text)
+                # Override only when the classifier is confident AND disagrees.
+                if backend_lang and backend_lang != declared and conf >= 0.8:
+                    print(f"⚠️ [LANG-MISMATCH] model={declared} backend={backend_lang} "
+                          f"conf={conf:.2f} text={turn_text[:50]!r} → using {backend_lang}")
+                    final_lang = backend_lang
+                    corrected = True
+                if meta is not None:
+                    meta["_current_user_turn_text"] = ""
+                    meta["last_declared_language"] = final_lang
+
+            result = get_language_accent_result(final_lang)
+            if corrected:
+                result["corrected"] = True
+                result["hint"] = (
+                    f"Override: the caller is speaking {result['language_name']} "
+                    f"({final_lang}), not '{declared}'. Speak the ENTIRE reply in "
+                    f"{result['language_name']} with that accent."
+                )
+            print(f"🌐 set_response_language → {result['language']} "
+                  f"({result['language_name']}){' [CORRECTED]' if corrected else ''}")
             return result
 
         # RAG Knowledge Base Search
@@ -576,6 +608,15 @@ async def media_stream_browser(websocket: WebSocket):
                                     print(f"⚠️ Rate limit warning: {limit_name} has {remaining} remaining")
                             continue
                         
+                        # Capture the caller's transcribed turn so the deterministic
+                        # language detector can correct the model's accent pick.
+                        if rtype == "conversation.item.input_audio_transcription.completed":
+                            transcript = (response.get("transcript") or "").strip()
+                            if transcript and call_id and call_id in call_metadata:
+                                call_metadata[call_id]["_current_user_turn_text"] = transcript
+                                print(f"📝 Caller turn transcript: {transcript[:80]!r}")
+                            continue
+
                         # Track when a response starts being created
                         if rtype == 'response.created':
                             response_active = True
@@ -732,7 +773,7 @@ async def media_stream_browser(websocket: WebSocket):
                                     current_rag_items.clear()
                                 
                                 result = await asyncio.wait_for(
-                                    execute_function_call(func_name, func_args),
+                                    execute_function_call(func_name, func_args, call_id),
                                     timeout=30.0  # 30 second timeout for function calls
                                 )
                             except asyncio.TimeoutError:
@@ -958,6 +999,9 @@ async def initialize_session(openai_ws, call_id):
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcmu"},  # g711 u-law @ 8kHz
+                    # Transcribe caller audio so the deterministic language
+                    # detector can correct the model's language/accent pick.
+                    "transcription": {"model": "whisper-1"},
                     "turn_detection": {
                         "type": "server_vad",
                         "threshold": 0.7,  # Speech detection sensitivity (0.0-1.0, lower = more sensitive)
