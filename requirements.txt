@@ -17,6 +17,7 @@ pygments
 rich
 attrs
 openai>=1.86.0,<2
+google-genai>=1.0
 PyJWT
 tzdata
 pinecone

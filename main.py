@@ -39,6 +39,11 @@ from rag_tools import search_knowledge_base
 
 from src.utils.audio_transcription import transcribe_audio, analyze_call_with_llm
 
+# Gemini Live voice backend (accent-correct native voices) — fixes the
+# Urdu-in-Arabic-accent bug. Selected by default; OpenAI stays available via env.
+from gemini_live import GeminiLiveClient, GeminiLiveConfig, GeminiResponse, get_gemini_voice
+from audio_utils import convert_browser_to_gemini, convert_gemini_to_browser, reset_audio_states
+
 load_dotenv(override=True)
 
 # --- Configuration ---
@@ -46,6 +51,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PORT = 7035
 
 VOICE = 'echo'
+
+# Voice engine for live calls. "gemini" (default) uses Gemini Live, whose native
+# multilingual voices speak Urdu/Hindi/Tamil/Tagalog in the correct native accent
+# instead of bleeding the default Arabic/Najdi accent the way OpenAI's realtime
+# voices do. Set VOICE_BACKEND=openai to use the legacy OpenAI gpt-realtime-2 path.
+VOICE_BACKEND = os.getenv("VOICE_BACKEND", "gemini").strip().lower()
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
 
 # Event types to log (but not treat as errors)
 LOG_EVENT_TYPES = [
@@ -471,8 +484,15 @@ async def chat_voice(
 @app.websocket("/media-stream-browser")
 async def media_stream_browser(websocket: WebSocket):
     await websocket.accept()
+    # Voice engine selection. Default is Gemini Live (accent-correct); set
+    # VOICE_BACKEND=openai to fall back to the legacy OpenAI realtime path.
+    if VOICE_BACKEND == "openai":
+        await _run_openai_browser_loop(websocket)
+    else:
+        await _run_gemini_browser_loop(websocket)
 
 
+async def _run_openai_browser_loop(websocket: WebSocket):
     openai_url = 'wss://api.openai.com/v1/realtime?model=gpt-realtime-2'
     # GA Realtime API: no "OpenAI-Beta: realtime=v1" header (the beta shape is disabled).
     headers = {
@@ -946,8 +966,288 @@ async def media_stream_browser(websocket: WebSocket):
             await websocket.close()
 
 
+async def _run_gemini_browser_loop(websocket: WebSocket):
+    """Gemini Live backend for browser calls — the accent-correct path.
+
+    Gemini's native multilingual voices speak Urdu/Hindi/Tamil/Tagalog in the
+    proper native accent (the whole reason this backend exists). Audio handling:
+    inbound browser audio is 8kHz linear PCM → resample to 16kHz for Gemini;
+    Gemini emits 24kHz PCM → forwarded to the browser with sampleRate=24000 (the
+    client reads the per-message rate). Tool calls reuse execute_function_call()
+    and the set_response_language / detect_language override unchanged.
+    """
+    call_id = None
+    user_pcm_buffer = io.BytesIO()    # caller audio, recorded at 8kHz (wire rate)
+    agent_pcm_buffer = io.BytesIO()   # agent audio, recorded at 24kHz (Gemini out)
+    AGENT_SAMPLE_RATE = 24000
+    reset_audio_states()
+    gemini_client = None
+
+    # --- 1) Wait for the browser 'start' event (auth + call metadata). ---
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            data = json.loads(msg)
+            event = data.get("event")
+            if event == "start":
+                token = data["start"]["customParameters"].get("token")
+                if not token:
+                    print("❌ No token provided in WebSocket connection")
+                    await websocket.close(code=1008, reason="Authentication required")
+                    return
+                try:
+                    user_data = verify_jwt_token(token)
+                    print(f"✅ WebSocket authenticated for user: {user_data['username']}")
+                except HTTPException as e:
+                    print(f"❌ Invalid token in WebSocket: {e.detail}")
+                    await websocket.close(code=1008, reason="Invalid or expired token")
+                    return
+                call_id = data["start"]["customParameters"].get("call_id")
+                break
+            elif event == "stop":
+                await websocket.close()
+                return
+            # Ignore any media frames that arrive before 'start'.
+    except (WebSocketDisconnect, json.JSONDecodeError) as e:
+        print(f"🔌 Browser disconnected before start (Gemini): {e}")
+        return
+
+    # --- 2) Build the Gemini session from the stored call metadata. ---
+    meta = call_metadata.get(call_id, {})
+    instructions = meta.get("instructions", "")
+    caller = meta.get("phone", "")
+    voice = meta.get("voice", "echo")
+    SYSTEM_MESSAGE = build_system_message(
+        instructions=instructions, caller=caller, voice=voice
+    )
+    gemini_voice = get_gemini_voice(voice)
+    print(f"🔧 Initializing Gemini session: voice={voice}→{gemini_voice}, model={GEMINI_MODEL}")
+
+    if not GOOGLE_API_KEY:
+        print("❌ GOOGLE_API_KEY is not set — cannot start Gemini backend")
+        try:
+            await websocket.send_json({
+                "event": "error",
+                "message": "Voice service is not configured. Please contact support."
+            })
+            await websocket.close()
+        except Exception:
+            pass
+        return
+
+    config = GeminiLiveConfig(
+        system_instruction=SYSTEM_MESSAGE,
+        tools=function_call_tools,
+        voice=gemini_voice,
+    )
+
+    try:
+        gemini_client = GeminiLiveClient(config)
+        await gemini_client.connect()
+        # Trigger the opening greeting (Gemini has no separate response.create).
+        await gemini_client.send_text(
+            "Start the conversation by greeting the customer warmly."
+        )
+    except Exception as e:
+        print(f"❌ Failed to connect to Gemini Live: {e}")
+        traceback.print_exc()
+        try:
+            await websocket.send_json({
+                "event": "error",
+                "message": "Connection to AI service failed. Please try again."
+            })
+            await websocket.close()
+        except Exception:
+            pass
+        return
+
+    async def receive_from_browser():
+        nonlocal call_id
+        try:
+            async for msg in websocket.iter_text():
+                try:
+                    data = json.loads(msg)
+                    if data.get("event") == "media":
+                        pcm_bytes = base64.b64decode(data["media"]["payload"])  # 8kHz linear PCM
+                        user_pcm_buffer.write(pcm_bytes)
+                        # 8k → 16k for Gemini; do NOT mulaw-encode.
+                        pcm_16k = convert_browser_to_gemini(pcm_bytes, input_rate=8000)
+                        await gemini_client.send_audio(pcm_16k)
+                    elif data.get("event") == "stop":
+                        print(f"🛑 Browser sent stop event for call {call_id}")
+                        break
+                except json.JSONDecodeError as je:
+                    print(f"⚠️ Failed to parse browser message: {je}")
+                    continue
+                except Exception as inner_e:
+                    print(f"⚠️ Error processing browser message: {inner_e}")
+                    traceback.print_exc()
+                    continue
+            print(f"🔚 Browser WebSocket stream ended normally for call {call_id}")
+        except WebSocketDisconnect:
+            print(f"🔌 Browser WebSocket disconnected for call {call_id}")
+        except Exception as e:
+            print(f"❌ Unexpected error in browser receive loop (Gemini): {e}")
+            traceback.print_exc()
+
+    async def receive_from_gemini_and_forward():
+        try:
+            async for resp in gemini_client.receive():
+                rtype = resp.type
+
+                if rtype == 'audio' and resp.audio_data:
+                    # 24kHz linear PCM from Gemini → browser (client reads sampleRate).
+                    agent_pcm_buffer.write(resp.audio_data)
+                    out = {
+                        "event": "media",
+                        "media": {
+                            "payload": base64.b64encode(resp.audio_data).decode('utf-8'),
+                            "format": "raw_pcm",
+                            "sampleRate": AGENT_SAMPLE_RATE,
+                            "channels": 1,
+                            "bitDepth": 16,
+                        }
+                    }
+                    await websocket.send_json(out)
+
+                elif rtype == 'input_transcription' and resp.transcription:
+                    # Feed the deterministic language detector exactly as the OpenAI
+                    # path does, so set_response_language can override the model's
+                    # language/accent pick. Chunks stream in; accumulate per turn
+                    # (the set_response_language handler clears it each reply).
+                    if call_id and call_id in call_metadata:
+                        prev = call_metadata[call_id].get("_current_user_turn_text", "")
+                        call_metadata[call_id]["_current_user_turn_text"] = (
+                            (prev + " " + resp.transcription).strip()
+                        )
+                        print(f"📝 Caller turn transcript: {call_metadata[call_id]['_current_user_turn_text'][:80]!r}")
+
+                elif rtype == 'tool_call' and resp.tool_calls:
+                    for tc in resp.tool_calls:
+                        func_name = tc.get("name")
+                        func_args = tc.get("arguments", {}) or {}  # already a dict
+                        tc_id = tc.get("id")
+                        print(f"🔧 Function call: {func_name} with args: {func_args}")
+                        try:
+                            result = await asyncio.wait_for(
+                                execute_function_call(func_name, func_args, call_id),
+                                timeout=30.0
+                            )
+                        except asyncio.TimeoutError:
+                            print(f"⚠️ Function call {func_name} timed out after 30 seconds")
+                            result = {
+                                "success": False,
+                                "error": "timeout",
+                                "message": "The operation timed out. Please try again."
+                            }
+                        print(f"✅ Function result: {result}")
+                        # Return the result to Gemini (it auto-generates the reply).
+                        await gemini_client.send_tool_response(
+                            [{"id": tc_id, "name": func_name, "response": result}]
+                        )
+                        # Mirror to the browser for UI parity with the OpenAI path.
+                        await websocket.send_json({
+                            "event": "function_result",
+                            "name": func_name,
+                            "arguments": json.dumps(func_args),
+                            "result": result,
+                        })
+
+                elif rtype in ('interrupted', 'session_resumed'):
+                    # Flush any stale audio buffered on the browser side.
+                    await websocket.send_json({"event": "clear"})
+
+                elif rtype == 'turn_complete':
+                    pass
+
+        except Exception as e:
+            print(f"❌ Unexpected error in Gemini receive loop: {e}")
+            traceback.print_exc()
+            try:
+                await websocket.send_json({
+                    "event": "error",
+                    "message": "An unexpected error occurred. Please try again."
+                })
+            except Exception:
+                pass
+
+    recv_task = asyncio.create_task(receive_from_browser())
+    send_task = asyncio.create_task(receive_from_gemini_and_forward())
+
+    try:
+        done, pending = await asyncio.wait(
+            [recv_task, send_task], return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in done:
+            if task.exception():
+                print(f"❌ Task exception (Gemini): {task.exception()}")
+        for task in pending:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+    except Exception as e:
+        print(f"❌ Error in Gemini main task loop: {e}")
+        traceback.print_exc()
+    finally:
+        with suppress(Exception):
+            await gemini_client.close()
+
+        if not call_id:
+            print("⚠️ No call_id; skipping recording, transcription, and analysis")
+            with suppress(Exception):
+                await websocket.close()
+            return
+
+        print(f"💾 Saving recordings for call {call_id}...")
+        user_file_path = f"recordings/user/{call_id}_user.wav"
+        agent_file_path = f"recordings/agent/{call_id}_agent.wav"
+
+        def save_wav_file(path: str, pcm_data: bytes, framerate: int):
+            with wave.open(path, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)   # 16-bit PCM
+                wf.setframerate(framerate)
+                wf.writeframes(pcm_data)
+
+        # Caller audio is 8kHz (wire rate); Gemini agent audio is 24kHz.
+        save_wav_file(user_file_path, user_pcm_buffer.getvalue(), 8000)
+        save_wav_file(agent_file_path, agent_pcm_buffer.getvalue(), AGENT_SAMPLE_RATE)
+        print(f"✅ Saved user audio: {user_file_path}")
+        print(f"✅ Saved agent audio: {agent_file_path}")
+
+        try:
+            user_transcript = await transcribe_audio(user_file_path)
+        except Exception as e:
+            print(f"⚠️ Could not transcribe user audio: {e}")
+            user_transcript = ""
+        try:
+            agent_transcript = await transcribe_audio(agent_file_path)
+        except Exception as e:
+            print(f"⚠️ Could not transcribe agent audio: {e}")
+            agent_transcript = ""
+
+        transcripts_output = {
+            "call_id": call_id,
+            "user_transcript": user_transcript,
+            "agent_transcript": agent_transcript,
+        }
+        with open(f"recordings/{call_id}_transcript.json", "w", encoding="utf-8") as f:
+            json.dump(transcripts_output, f, ensure_ascii=False, indent=2)
+        print(f"📝 Transcript file written for call {call_id}")
+
+        try:
+            analysis_result = await analyze_call_with_llm(call_id, user_transcript, agent_transcript)
+            print(f"📊 Call analysis complete: {analysis_result}")
+        except Exception as e:
+            print(f"⚠️ Call analysis failed: {e}")
+            traceback.print_exc()
+
+        with suppress(Exception):
+            await websocket.close()
+
+
 async def send_initial_conversation_item(openai_ws):
-    
+
     await openai_ws.send(json.dumps({"type": "response.create"}))
 
 @app.get("/call-analysis/{call_id}")
