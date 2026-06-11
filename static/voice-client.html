@@ -2142,31 +2142,62 @@
         });
         micSource = micContext.createMediaStreamSource(stream);
 
-        // Create AudioWorklet processor inline
+        // Create AudioWorklet processor inline.
+        // Adaptive VAD (ported from ../bankislami-callcenter): a low absolute
+        // threshold + adaptive noise floor + SNR gate catches soft/interrupting
+        // speech, an onset counter rejects clicks, and a preroll ring buffer
+        // replays the audio just before speech onset so the start isn't clipped.
+        // This is what lets the caller INTERRUPT the agent — quiet interjections
+        // now reach Gemini's server-side VAD, which cancels the agent's turn.
         const workletCode = `
           class AudioProcessor extends AudioWorkletProcessor {
             constructor() {
               super();
               this.lastVoiceTime = currentTime;
+              this.wasSpeaking = false;
+              this.PREROLL_CHUNKS = Math.ceil(0.5 * sampleRate / 128);
+              this.ringBuffer = [];
+              this.noiseFloor = 0.01;
+              this.loudStreak = 0;
             }
             process(inputs, outputs, parameters) {
               const input = inputs[0];
               if (!input || !input[0]) return true;
-              
+
               const ch = input[0];
               let sum = 0;
               for (let i = 0; i < ch.length; i++) sum += ch[i] * ch[i];
               const rms = Math.sqrt(sum / ch.length);
-              
-              const VOLUME_THRESHOLD = 0.04;  // Lower threshold to catch softer speech
-              const HANGOVER_MS = 0.5;  // Longer hangover to bridge natural pauses
-              
-              if (rms > VOLUME_THRESHOLD) {
+
+              const VOLUME_THRESHOLD = 0.01;  // Low floor so soft interruptions register
+              const MIN_SNR = 2.0;            // Must be 2x above the adaptive noise floor
+              const HANGOVER_S = 0.2;         // Bridge natural pauses within a phrase
+              const ONSET_FRAMES = 2;         // Require 2 loud frames to reject clicks/pops
+
+              // Slowly track the background noise level (only when quiet).
+              if (rms < this.noiseFloor * 2) {
+                this.noiseFloor = 0.95 * this.noiseFloor + 0.05 * rms;
+              }
+              const isLoudEnough = rms > VOLUME_THRESHOLD && rms > this.noiseFloor * MIN_SNR;
+              if (isLoudEnough) this.loudStreak++; else this.loudStreak = 0;
+              const speechOnset = this.loudStreak >= ONSET_FRAMES;
+              if (speechOnset) {
                 this.lastVoiceTime = currentTime;
               }
-              
-              const shouldSendAudio = rms > VOLUME_THRESHOLD || (currentTime - this.lastVoiceTime) < HANGOVER_MS;
-              this.port.postMessage({ audio: ch, sendAudio: shouldSendAudio });
+              const isSpeaking = speechOnset || (currentTime - this.lastVoiceTime) < HANGOVER_S;
+
+              if (isSpeaking && !this.wasSpeaking) {
+                const preroll = this.ringBuffer;
+                this.ringBuffer = [];
+                this.port.postMessage({ audio: ch, sendAudio: true, preroll: preroll });
+              } else if (isSpeaking) {
+                this.port.postMessage({ audio: ch, sendAudio: true });
+              } else {
+                this.ringBuffer.push(new Float32Array(ch));
+                if (this.ringBuffer.length > this.PREROLL_CHUNKS) this.ringBuffer.shift();
+                this.port.postMessage({ audio: ch, sendAudio: false });
+              }
+              this.wasSpeaking = isSpeaking;
               return true;
             }
           }
@@ -2184,7 +2215,19 @@
         });
 
         micProc.port.onmessage = (e) => {
-          const { audio, sendAudio } = e.data;
+          const { audio, sendAudio, preroll } = e.data;
+
+          // Flush the preroll ring buffer first so the very start of the
+          // caller's speech (just before onset) isn't clipped.
+          if (preroll && preroll.length > 0) {
+            for (const chunk of preroll) {
+              const pcm16 = floatTo16BitPCM(chunk);
+              const b64 = uint8ToBase64(pcm16);
+              if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ event: "media", media: { payload: b64, timestamp: Date.now() } }));
+              }
+            }
+          }
 
           if (sendAudio) {
             const pcm16 = floatTo16BitPCM(audio);

@@ -5,7 +5,7 @@ This module provides a client wrapper for Google's Gemini Live API,
 handling WebSocket connections, audio streaming, and function calling.
 
 It is the accent-correct voice backend for the Al Fardan Exchange agent:
-Gemini's native multilingual voices speak Urdu/Hindi/Tamil/Tagalog in the
+Gemini's native multilingual voices speak Urdu/Tamil/Tagalog in the
 correct native accent, instead of bleeding the default Arabic/Najdi accent the
 way OpenAI's realtime voices do. Ported from ../bankislami-callcenter.
 """

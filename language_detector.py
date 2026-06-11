@@ -1,20 +1,24 @@
 """
-Deterministic language detector for the Al Fardan Exchange voice agent's six
-supported languages: Najdi Arabic (ar, default), Pakistani Urdu (ur), Hindi (hi),
+Deterministic language detector for the Al Fardan Exchange voice agent's five
+supported languages: Najdi Arabic (ar, default), Pakistani Urdu (ur),
 Tamil (ta), Tagalog/Filipino (tl), and English (en).
+
+Hindi is NOT supported: Devanagari-script transcriptions are treated as
+out-of-scope/misheard audio and left unclassified (None) so the agent stays in
+its default/last language instead of switching to Hindi.
 
 Runs on the realtime model's input_audio_transcription text and acts as a second,
 authoritative signal that silently corrects the model's own language pick via the
 `set_response_language` tool dispatcher — the same pattern used in
 ../bankislami-callcenter. This is what stops the model from carrying the default
-Najdi accent into Urdu/Hindi/Tamil/Tagalog: when the classifier is confident the
+Najdi accent into Urdu/Tamil/Tagalog: when the classifier is confident the
 caller used another language, the tool result forces that language + its accent.
 
 Pure-Python, no external dependencies.
 
 Strategy:
   - Tamil script (U+0B80–U+0BFF)        → ta  (decisive: unique script)
-  - Devanagari script (U+0900–U+097F)   → hi  (decisive: unique script)
+  - Devanagari script (U+0900–U+097F)   → None (Hindi unsupported; out-of-scope)
   - Arabic script (U+0600–U+06FF):
         Urdu-specific Perso-Arabic letters (ٹ ڈ ڑ ں ہ ھ ے گ چ پ ژ ک ی)
         or Urdu anchor words → ur; otherwise → ar.
@@ -105,11 +109,13 @@ def _has_range(text: str, lo: int, hi: int) -> int:
 
 
 def detect_language(text: str) -> tuple[Optional[str], float, dict]:
-    """Classify text into one of {ar, ur, hi, ta, tl, en} or None.
+    """Classify text into one of {ar, ur, ta, tl, en} or None.
 
     Returns (lang, confidence, debug) where confidence is in [0, 1].
-    Script-based hits (Tamil, Devanagari, Urdu-only letters) are decisive
-    (confidence 1.0). Latin/Arabic ambiguity falls back to anchor scoring.
+    Script-based hits (Tamil, Urdu-only letters) are decisive (confidence 1.0).
+    Latin/Arabic ambiguity falls back to anchor scoring. Hindi is NOT supported:
+    Devanagari script is treated as out-of-scope and returns None so the agent
+    keeps its default/last language rather than switching to Hindi.
     """
     if not text or not text.strip():
         return None, 0.0, {}
@@ -122,7 +128,9 @@ def detect_language(text: str) -> tuple[Optional[str], float, dict]:
     if tamil:
         return "ta", 1.0, {"script": "tamil", "chars": tamil}
     if deva:
-        return "hi", 1.0, {"script": "devanagari", "chars": deva}
+        # Hindi is unsupported — do not classify Devanagari as a language.
+        # Treat as out-of-scope/misheard so no language override is applied.
+        return None, 0.0, {"script": "devanagari", "chars": deva, "unsupported": "hi"}
 
     # --- Arabic-script: disambiguate ar vs ur ---
     arabic = _has_range(norm, 0x0600, 0x06FF) + _has_range(norm, 0x0750, 0x077F)

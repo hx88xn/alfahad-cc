@@ -53,7 +53,7 @@ PORT = 7035
 VOICE = 'echo'
 
 # Voice engine for live calls. "gemini" (default) uses Gemini Live, whose native
-# multilingual voices speak Urdu/Hindi/Tamil/Tagalog in the correct native accent
+# multilingual voices speak Urdu/Tamil/Tagalog in the correct native accent
 # instead of bleeding the default Arabic/Najdi accent the way OpenAI's realtime
 # voices do. Set VOICE_BACKEND=openai to use the legacy OpenAI gpt-realtime-2 path.
 VOICE_BACKEND = os.getenv("VOICE_BACKEND", "gemini").strip().lower()
@@ -199,7 +199,7 @@ async def handle_incoming_call(request: Request):
     }
     
     response = VoiceResponse()
-    # Supported languages: Arabic (default), Urdu, Hindi, Tamil, Tagalog - the AI will detect language automatically
+    # Supported languages: Arabic (default), Urdu, Tamil, Tagalog - the AI will detect language automatically (Hindi is NOT supported)
     response.say("This call may be recorded for quality purposes.", voice='Polly.Danielle-Generative', language='en-US')
     response.pause(length=1)
     host = request.url.hostname
@@ -254,7 +254,7 @@ async def execute_function_call(func_name: str, func_args: dict, call_id: str | 
     try:
         # Per-turn language + accent re-anchor (silent). Echoes a per-language
         # accent instruction back to the model so it never carries the default
-        # Najdi accent into Urdu/Hindi/Tamil/Tagalog/English. A deterministic
+        # Najdi accent into Urdu/Tamil/Tagalog/English. A deterministic
         # classifier on the caller's transcribed turn silently OVERRIDES the
         # model's pick when it disagrees with high confidence (the bankislami
         # pattern) — this is what reliably stops Najdi-accent bleed.
@@ -969,7 +969,7 @@ async def _run_openai_browser_loop(websocket: WebSocket):
 async def _run_gemini_browser_loop(websocket: WebSocket):
     """Gemini Live backend for browser calls — the accent-correct path.
 
-    Gemini's native multilingual voices speak Urdu/Hindi/Tamil/Tagalog in the
+    Gemini's native multilingual voices speak Urdu/Tamil/Tagalog in the
     proper native accent (the whole reason this backend exists). Audio handling:
     inbound browser audio is 8kHz linear PCM → resample to 16kHz for Gemini;
     Gemini emits 24kHz PCM → forwarded to the browser with sampleRate=24000 (the
@@ -1153,7 +1153,15 @@ async def _run_gemini_browser_loop(websocket: WebSocket):
                             "result": result,
                         })
 
-                elif rtype in ('interrupted', 'session_resumed'):
+                elif rtype == 'interrupted':
+                    # Caller barged in while the agent was speaking. Gemini's
+                    # server-side VAD has already cancelled the agent's turn;
+                    # tell the browser to STOP playback immediately and drop any
+                    # audio still queued so the bot goes silent at once.
+                    print("⛔ Interruption detected — stopping agent audio")
+                    await websocket.send_json({"event": "clear"})
+
+                elif rtype == 'session_resumed':
                     # Flush any stale audio buffered on the browser side.
                     await websocket.send_json({"event": "clear"})
 
